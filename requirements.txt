@@ -1,0 +1,11 @@
+﻿fastapi
+uvicorn[standard]
+SQLAlchemy
+psycopg[binary]
+python-dotenv
+email-validator
+google-auth
+google-auth-oauthlib
+google-api-python-client
+cryptography
+itsdangerous
