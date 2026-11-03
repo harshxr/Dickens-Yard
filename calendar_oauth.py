@@ -1,11 +1,13 @@
 
 import os
 import secrets
+import hmac
+import logging
 from urllib.parse import quote
 
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from fastapi.responses import HTMLResponse, RedirectResponse
 from google_auth_oauthlib.flow import Flow
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -26,6 +28,7 @@ load_dotenv(
 )
 
 router = APIRouter(prefix="/api/v1/calendar/google", tags=["Google Calendar"])
+logger = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
@@ -45,32 +48,50 @@ DEMO_BUSINESS_ID = os.getenv(
 )
 
 
-def require_local_development(request: Request):
-    """Reject this temporary integration outside local development."""
-    if os.getenv("CALENDAR_LOCAL_DEV_ONLY", "").lower() != "true":
-        raise HTTPException(
-            status_code=503,
-            detail="Google Calendar OAuth is disabled.",
-        )
-
-    if not request.client or request.client.host not in {
-        "127.0.0.1", "::1"
-    }:
-        raise HTTPException(
-            status_code=403,
-            detail="This development endpoint is local-only.",
-        )
-
+def require_calendar_configured():
+    """Verify that Google Calendar OAuth secrets are configured."""
     if not all([
         CLIENT_ID,
         CLIENT_SECRET,
         STATE_SECRET,
         ENCRYPTION_KEY,
+        REDIRECT_URI,
     ]):
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail="Google Calendar environment settings are missing.",
         )
+
+
+def require_calendar_admin(
+    authorization: str | None = Header(default=None),
+):
+    """Authenticate calendar administration using a dedicated bearer token."""
+    configured_token = os.getenv("CALENDAR_ADMIN_TOKEN", "")
+
+    if len(configured_token) < 32:
+        raise HTTPException(
+            status_code=503,
+            detail="Calendar administration is not configured.",
+        )
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Calendar admin authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    supplied_token = authorization[7:]
+
+    if not hmac.compare_digest(supplied_token, configured_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid calendar admin credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    require_calendar_configured()
 
 
 def create_flow(state=None, code_verifier=None):
@@ -105,10 +126,9 @@ def state_serializer():
 
 @router.get("/connect")
 def connect_google_calendar(
-    request: Request,
     db: Session = Depends(get_db),
+    admin: None = Depends(require_calendar_admin),
 ):
-    require_local_development(request)
 
     business_id = DEMO_BUSINESS_ID
 
@@ -123,17 +143,12 @@ def connect_google_calendar(
         "nonce": secrets.token_urlsafe(24),
         "code_verifier": code_verifier,
     })
-    print("CONNECT secret length:", len(STATE_SECRET or ""))
-    print("CONNECT serializer salt:", "google-calendar-oauth-state")
-
     authorization_url, _ = flow.authorization_url(
     state=signed_state,
     access_type="offline",
     prompt="consent",
     include_granted_scopes="true",
     )
-
-    print("Generated state length:", len(signed_state))
 
     return RedirectResponse(
         authorization_url,
@@ -144,16 +159,11 @@ def connect_google_calendar(
 
 @router.get("/callback", response_class=HTMLResponse)
 def google_calendar_callback(
-    request: Request,
     state: str,
     code: str,
     db: Session = Depends(get_db),
 ):
-    require_local_development(request)
-
-    print("CALLBACK secret length:", len(STATE_SECRET or ""))
-    print("CALLBACK serializer salt:", "google-calendar-oauth-state")
-    print("Received state length:", len(state))
+    require_calendar_configured()
 
     try:
         payload = state_serializer().loads(state, max_age=600)
@@ -192,20 +202,15 @@ def google_calendar_callback(
     try:
         flow.fetch_token(code=code)
     except Exception as exc:
-        print(
-            f"Google OAuth token exchange failed: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        logger.warning("Google OAuth token exchange failed (%s).", type(exc).__name__)
         raise HTTPException(
             status_code=400,
-            detail="Google authorization failed. Check the server terminal.",
-        )
+            detail="Google authorization failed. Check the local OAuth configuration and try again.",
+        ) from None
 
     credentials = flow.credentials
     refresh_token = credentials.refresh_token
 
-    # Reauthorization may not return a refresh token. Preserve the
-    # existing token in that case rather than overwriting it.
     connection = (
         db.query(GoogleCalendarConnection)
         .filter(
@@ -214,38 +219,49 @@ def google_calendar_callback(
         .first()
     )
 
+    # Only a newly issued refresh token can restore a connection. Keep any
+    # existing ciphertext, but do not leave it marked healthy after this attempt.
     if not refresh_token:
-        if connection is None:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Google did not return a refresh token. "
-                    "Revoke this app's access in your Google Account "
-                    "and connect again."
-                ),
-            )
-    else:
-        try:
-            encrypted_token = Fernet(
-                ENCRYPTION_KEY.encode()
-            ).encrypt(refresh_token.encode()).decode()
-        except Exception:
-            raise HTTPException(
-                status_code=500,
-                detail="Could not encrypt the Google refresh token.",
-            )
+        if connection is not None:
+            connection.connected = False
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not update the Google Calendar connection state.",
+                ) from None
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google did not issue a refresh token. Existing credentials were preserved "
+                "and the connection requires reconnection. Revoke this app's access in "
+                "your Google Account, then reconnect with consent."
+            ),
+        )
 
-        if connection is None:
-            connection = GoogleCalendarConnection(
-                business_id=DEMO_BUSINESS_ID,
-                calendar_id="primary",
-                encrypted_refresh_token=encrypted_token,
-                connected=True,
-            )
-            db.add(connection)
-        else:
-            connection.encrypted_refresh_token = encrypted_token
-            connection.connected = True
+    try:
+        encrypted_token = Fernet(
+            ENCRYPTION_KEY.encode()
+        ).encrypt(refresh_token.encode()).decode()
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not securely store the Google authorization. No connection was changed.",
+        )
+
+    if connection is None:
+        connection = GoogleCalendarConnection(
+            business_id=DEMO_BUSINESS_ID,
+            calendar_id="primary",
+            encrypted_refresh_token=encrypted_token,
+            connected=True,
+        )
+        db.add(connection)
+    else:
+        connection.encrypted_refresh_token = encrypted_token
+        connection.connected = True
 
     try:
         db.commit()
@@ -264,10 +280,9 @@ def google_calendar_callback(
 
 @router.get("/status")
 def google_calendar_status(
-    request: Request,
     db: Session = Depends(get_db),
+    admin: None = Depends(require_calendar_admin),
 ):
-    require_local_development(request)
 
     connection = (
         db.query(GoogleCalendarConnection)
@@ -287,11 +302,10 @@ def google_calendar_status(
 
 @router.get("/events")
 def google_calendar_events(
-    request: Request,
     max_results: int = 10,
     db: Session = Depends(get_db),
+    admin: None = Depends(require_calendar_admin),
 ):
-    require_local_development(request)
 
     if not 1 <= max_results <= 50:
         raise HTTPException(
@@ -316,10 +330,9 @@ class CalendarEventCreate(BaseModel):
 @router.post("/events")
 def create_google_calendar_event(
     body: CalendarEventCreate,
-    request: Request,
     db: Session = Depends(get_db),
+    admin: None = Depends(require_calendar_admin),
 ):
-    require_local_development(request)
 
     return create_calendar_event(
         db=db,
