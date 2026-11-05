@@ -1,4 +1,4 @@
-﻿fastapi
+fastapi
 uvicorn[standard]
 SQLAlchemy
 psycopg[binary]
@@ -9,3 +9,9 @@ google-auth-oauthlib
 google-api-python-client
 cryptography
 itsdangerous
+livekit-api==1.2.1
+
+phonenumbers==9.0.42
+
+resend==2.51.0
+APScheduler==3.11.3

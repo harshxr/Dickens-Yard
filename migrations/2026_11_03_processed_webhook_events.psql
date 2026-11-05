@@ -1,0 +1,13 @@
+﻿-- Create storage for processed LiveKit webhook events.
+-- Safe to run more than once.
+
+CREATE TABLE IF NOT EXISTS processed_webhook_events (
+    id SERIAL PRIMARY KEY,
+    event_id VARCHAR(255) NOT NULL UNIQUE,
+    event_type VARCHAR(100) NOT NULL,
+    room_name VARCHAR(150),
+    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_processed_webhook_events_room_name
+    ON processed_webhook_events (room_name);

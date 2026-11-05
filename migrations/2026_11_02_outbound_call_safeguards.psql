@@ -1,0 +1,65 @@
+﻿-- Additive Phase 8B schema for authenticated, auditable outbound requests.
+-- Existing call rows are preserved. New association and idempotency columns
+-- remain NULL for historical rows, which do not have those request details.
+-- Review on a restored copy first; adding the index can lock this table.
+
+CREATE TABLE IF NOT EXISTS outbound_calls (
+    id SERIAL PRIMARY KEY,
+    room_name VARCHAR(150) NOT NULL UNIQUE,
+    sip_call_id VARCHAR(150),
+    phone_masked VARCHAR(30) NOT NULL,
+    phone_hash VARCHAR(64) NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'initiated',
+    consent BOOLEAN NOT NULL DEFAULT FALSE,
+    consent_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    source VARCHAR(100) NOT NULL DEFAULT 'nivakya-website',
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    business_id VARCHAR(100),
+    lead_id INTEGER,
+    idempotency_key_hash VARCHAR(64),
+    request_hash VARCHAR(64),
+    purpose VARCHAR(200),
+    caller_id VARCHAR(20),
+    consent_attestation_id VARCHAR(200),
+    requested_by VARCHAR(100)
+);
+
+ALTER TABLE outbound_calls
+    ADD COLUMN IF NOT EXISTS business_id VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS lead_id INTEGER,
+    ADD COLUMN IF NOT EXISTS idempotency_key_hash VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS request_hash VARCHAR(64),
+    ADD COLUMN IF NOT EXISTS purpose VARCHAR(200),
+    ADD COLUMN IF NOT EXISTS caller_id VARCHAR(20),
+    ADD COLUMN IF NOT EXISTS consent_attestation_id VARCHAR(200),
+    ADD COLUMN IF NOT EXISTS requested_by VARCHAR(100);
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_outbound_calls_lead_id_leads'
+          AND conrelid = 'outbound_calls'::regclass
+    ) THEN
+        ALTER TABLE outbound_calls
+            ADD CONSTRAINT fk_outbound_calls_lead_id_leads
+            FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS ix_outbound_calls_business_id
+    ON outbound_calls (business_id);
+CREATE INDEX IF NOT EXISTS ix_outbound_calls_lead_id
+    ON outbound_calls (lead_id);
+CREATE INDEX IF NOT EXISTS ix_outbound_calls_business_request_created
+    ON outbound_calls (business_id, request_hash, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_outbound_calls_business_idempotency_hash
+    ON outbound_calls (business_id, idempotency_key_hash);
+
+
+CREATE INDEX IF NOT EXISTS ix_outbound_calls_sip_call_id
+    ON outbound_calls (sip_call_id);
+
+CREATE INDEX IF NOT EXISTS ix_outbound_calls_phone_hash
+    ON outbound_calls (phone_hash);

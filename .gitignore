@@ -11,3 +11,25 @@ __pycache__/
 backup_before_google_calendar_*/
 *.backup
 
+
+# Local environments
+.venv312/
+.env.local
+
+# Python and test artifacts
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Backup and temporary files
+*.bak
+*.tmp
+openapi-local.json
+
+# Database backups - never upload
+*.dump
+*.sql
+
+# Temporary source-code backups
+*_before_*.py
