@@ -265,8 +265,8 @@ def mark_booking_reconciliation_required(
             db.commit()
     except Exception as exc:
         db.rollback()
-        logger.error(
-            "Could not persist recovery state for appointment %s (error type %s).",
+        logger.exception(
+            "Could not persist recovery state for appointment %s. Error: %s",
             appointment_id,
             type(exc).__name__,
         )
@@ -1518,10 +1518,11 @@ def book_appointment(
             detail="The appointment is saved as pending and is not confirmed. Retry the same request with the same Idempotency-Key.",
         ) from exc
     except Exception as exc:
-        logger.error(
-            "Booking %s requires Calendar reconciliation (error type %s).",
+        logger.exception(
+            "Booking %s requires Calendar reconciliation. Error type: %s. Error: %s",
             booking.id,
             type(exc).__name__,
+            str(exc),
         )
         mark_booking_reconciliation_required(
             db, appointment.business_id, idempotency_key, booking.id
