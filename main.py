@@ -27,6 +27,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from calendar_oauth import router as google_calendar_router
+from google_sheets_service import sync_customer_to_google_sheet
 from calendar_service import (
     check_calendar_conflicts,
     create_calendar_event,
@@ -802,10 +803,22 @@ def create_lead(
         db.add(new_lead)
         db.commit()
         db.refresh(new_lead)
-        return new_lead
     except Exception:
         db.rollback()
         raise
+
+    try:
+        sync_customer_to_google_sheet(
+            phone=new_lead.phone,
+            customer_name=new_lead.name or "",
+            enquiry_service=new_lead.interest or "",
+            booking_status=new_lead.status or "New lead",
+            call_outcome="Lead created",
+        )
+    except Exception:
+        logger.exception("Google Sheets lead sync failed.")
+
+    return new_lead
 
 
 @app.get(
@@ -860,10 +873,22 @@ def update_lead(
     try:
         db.commit()
         db.refresh(lead)
-        return lead
     except Exception:
         db.rollback()
         raise
+
+    try:
+        sync_customer_to_google_sheet(
+            phone=lead.phone,
+            customer_name=lead.name or "",
+            enquiry_service=lead.interest or "",
+            booking_status=lead.status or "",
+            call_outcome="Lead updated",
+        )
+    except Exception:
+        logger.exception("Google Sheets lead update sync failed.")
+
+    return lead
 
 
 @app.delete("/api/v1/leads/{lead_id}")
@@ -936,7 +961,6 @@ def check_appointment_availability(
             "message": "The requested time conflicts with an existing appointment.",
         }
 
-
     # OAuth management routes are locally gated; appointment availability still
     # requires the stored business Calendar connection. Service failures propagate
     # as errors so this endpoint never reports a free slot without checking Google.
@@ -959,6 +983,7 @@ def check_appointment_availability(
         "available": True,
         "message": "No conflicting appointment or Google Calendar event was found.",
     }
+
 
 @app.get("/api/v1/appointments/alternatives")
 def get_appointment_alternatives(
@@ -999,7 +1024,6 @@ def get_appointment_alternatives(
         tzinfo=london_tz,
     ).astimezone(timezone.utc)
 
-    # Fetch database appointments once for the entire search window.
     db_conflicts = (
         db.query(Appointment)
         .filter(
@@ -1011,7 +1035,6 @@ def get_appointment_alternatives(
         .all()
     )
 
-    # Fetch Google Calendar events once for the entire search window.
     calendar_events = list_calendar_events_in_range(
         db=db,
         business_id=business_id,
@@ -1035,7 +1058,6 @@ def get_appointment_alternatives(
                 normalize_appointment_utc(end_value),
             )
 
-        # All-day Google Calendar events use exclusive end dates.
         if event_start.get("date") and event_end.get("date"):
             all_day_start = datetime.combine(
                 datetime.fromisoformat(event_start["date"]).date(),
@@ -1062,11 +1084,9 @@ def get_appointment_alternatives(
 
     alternatives = []
 
-    # Search the requested London date first, then later dates.
     for day_offset in range(days_ahead + 1):
         candidate_date = requested_local.date() + timedelta(days=day_offset)
 
-        # Sunday is closed.
         if candidate_date.weekday() >= 6:
             continue
 
@@ -1097,20 +1117,14 @@ def get_appointment_alternatives(
             candidate_start = candidate_local.astimezone(timezone.utc)
             candidate_end = candidate_end_local.astimezone(timezone.utc)
 
-            # Do not offer the exact time originally requested.
             if candidate_start == requested_start:
                 continue
 
-            candidates.append(
-                (candidate_start, candidate_end, candidate_local)
-            )
+            candidates.append((candidate_start, candidate_end, candidate_local))
 
-        # On the requested day, offer the nearest alternatives first.
         if day_offset == 0:
             candidates.sort(
-                key=lambda item: abs(
-                    (item[0] - requested_start).total_seconds()
-                )
+                key=lambda item: abs((item[0] - requested_start).total_seconds())
             )
 
         for candidate_start, candidate_end, candidate_local in candidates:
@@ -1129,13 +1143,13 @@ def get_appointment_alternatives(
             if database_busy or calendar_busy:
                 continue
 
-            alternatives.append({
-                "start_at": candidate_local.isoformat(),
-                "end_at": (
-                    candidate_local + duration
-                ).isoformat(),
-                "timezone": "Europe/London",
-            })
+            alternatives.append(
+                {
+                    "start_at": candidate_local.isoformat(),
+                    "end_at": (candidate_local + duration).isoformat(),
+                    "timezone": "Europe/London",
+                }
+            )
 
             if len(alternatives) >= max_results:
                 break
@@ -1201,9 +1215,7 @@ def create_appointment(
         )
 
     new_appointment = Appointment(
-        **appointment.model_dump(
-            exclude={"start_at", "end_at"}
-        ),
+        **appointment.model_dump(exclude={"start_at", "end_at"}),
         start_at=start_at,
         end_at=end_at,
     )
@@ -1212,20 +1224,39 @@ def create_appointment(
         db.add(new_appointment)
         db.commit()
         db.refresh(new_appointment)
-        return AppointmentResponse(
-            id=new_appointment.id,
-            business_id=new_appointment.business_id,
-            lead_id=new_appointment.lead_id,
-            service=new_appointment.service,
-            start_at=normalize_appointment_utc(new_appointment.start_at),
-            end_at=normalize_appointment_utc(new_appointment.end_at),
-            status=new_appointment.status,
-            notes=new_appointment.notes,
-            created_at=normalize_appointment_utc(new_appointment.created_at),
-        )
     except Exception:
         db.rollback()
         raise
+
+    local_start = normalize_appointment_utc(new_appointment.start_at).astimezone(
+        ZoneInfo("Europe/London")
+    )
+
+    try:
+        sync_customer_to_google_sheet(
+            phone=lead.phone,
+            customer_name=lead.name or "",
+            enquiry_service=new_appointment.service or "",
+            appointment_date=local_start.strftime("%Y-%m-%d"),
+            appointment_time=local_start.strftime("%H:%M"),
+            booking_status=new_appointment.status or "Created",
+            call_outcome="Appointment created",
+        )
+    except Exception:
+        logger.exception("Google Sheets appointment sync failed.")
+
+    return AppointmentResponse(
+        id=new_appointment.id,
+        business_id=new_appointment.business_id,
+        lead_id=new_appointment.lead_id,
+        service=new_appointment.service,
+        start_at=normalize_appointment_utc(new_appointment.start_at),
+        end_at=normalize_appointment_utc(new_appointment.end_at),
+        status=new_appointment.status,
+        notes=new_appointment.notes,
+        created_at=normalize_appointment_utc(new_appointment.created_at),
+    )
+
 
 def schedule_appointment_notifications(db, booking, lead):
     """
@@ -1276,6 +1307,8 @@ def schedule_appointment_notifications(db, booking, lead):
             "Appointment %s is less than 24 hours away; 24-hour reminder skipped.",
             booking.id,
         )
+
+
 @app.post("/api/v1/appointments/book")
 def book_appointment(
     appointment: AppointmentCreate,
@@ -1286,8 +1319,6 @@ def book_appointment(
     end_utc = normalize_appointment_request_time(appointment.end_at, "end_at")
 
     request_hash = appointment_request_fingerprint(appointment, start_utc, end_utc)
-    # The fallback preserves older callers and makes their exact normalized
-    # request replay-safe. New clients send their own stable key explicitly.
     if idempotency_key is None:
         idempotency_key = f"legacy-{request_hash}"
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", idempotency_key):
@@ -1296,8 +1327,6 @@ def book_appointment(
             detail="Idempotency-Key must contain 1–128 letters, digits, '.', '_', ':', or '-'.",
         )
 
-    # Resolve successful retries before depending on a live lead or Calendar
-    # connection. The database result remains replayable after a restart.
     booking = (
         db.query(Appointment)
         .filter(
@@ -1332,8 +1361,6 @@ def book_appointment(
             detail="Lead not found.",
         )
 
-    # Serialize reservations for this business using its existing Calendar
-    # connection row. This coordinates different keys competing for one slot.
     calendar_connection = (
         db.query(GoogleCalendarConnection)
         .filter(
@@ -1408,8 +1435,6 @@ def book_appointment(
         )
         db.add(booking)
         try:
-            # Persist a slot reservation and idempotency record before external
-            # I/O. It survives an application restart during Calendar creation.
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -1436,8 +1461,6 @@ def book_appointment(
         booking.booking_state = "calendar_pending"
         db.commit()
 
-    # After a new reservation commit, take a row lock before Calendar work.
-    # Retries on any worker serialize on this durable booking row.
     try:
         booking = (
             db.query(Appointment)
@@ -1499,9 +1522,7 @@ def book_appointment(
         booking.status = "confirmed"
 
         schedule_appointment_notifications(db, booking, lead)
-
         db.commit()
-
     except HTTPException as exc:
         if exc.status_code == 409 and booking.booking_state == "calendar_conflict":
             raise
@@ -1531,6 +1552,23 @@ def book_appointment(
             status_code=503,
             detail="The appointment is saved as pending and is not confirmed. Retry the same request with the same Idempotency-Key.",
         ) from exc
+
+    local_start = normalize_appointment_utc(booking.start_at).astimezone(
+        ZoneInfo("Europe/London")
+    )
+
+    try:
+        sync_customer_to_google_sheet(
+            phone=lead.phone,
+            customer_name=lead.name or "",
+            enquiry_service=booking.service or "",
+            appointment_date=local_start.strftime("%Y-%m-%d"),
+            appointment_time=local_start.strftime("%H:%M"),
+            booking_status="Confirmed",
+            call_outcome="Appointment booked by voice agent",
+        )
+    except Exception:
+        logger.exception("Google Sheets voice booking sync failed.")
 
     return appointment_booking_result(booking)
 
